@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mạch báo cháy gia đình - ESP32 MQTT</title>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #f4f6f9; --surface: #ffffff; --text: #1d2733; --muted: #6b7785;
+    --border: #e1e6ec; --ok: #1e9e5a; --warn: #d92d20; --accent: #2563eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f141a; --surface:#18202a; --text:#e8edf3; --muted:#93a1b1; --border:#2a3542; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { padding:20px 16px 8px; max-width:1100px; margin:0 auto; }
+  h1 { margin:0; font-size:1.4rem; }
+  .status { display:flex; gap:12px; align-items:center; margin-top:8px; color:var(--muted); font-size:.9rem; flex-wrap:wrap; }
+  .dot { width:10px; height:10px; border-radius:50%; background:#999; display:inline-block; margin-right:6px; }
+  .dot.on { background:var(--ok); }
+  main { max-width:1100px; margin:0 auto; padding:8px 16px 32px; display:grid; gap:16px;
+         grid-template-columns: repeat(2, 1fr); }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:18px; }
+  .card h2 { margin:0 0 6px; font-size:.95rem; color:var(--muted); font-weight:600; }
+  .value { font-size:3rem; font-weight:700; line-height:1.1; }
+  .value small { font-size:1.1rem; color:var(--muted); font-weight:500; margin-left:4px; }
+  .card.alarm { border-color:var(--warn); box-shadow:0 0 0 2px color-mix(in srgb, var(--warn) 25%, transparent); }
+  .card.alarm .value { color:var(--warn); }
+  .badge { display:inline-block; margin-top:8px; padding:3px 10px; border-radius:999px; font-size:.8rem;
+           background:color-mix(in srgb, var(--ok) 15%, transparent); color:var(--ok); font-weight:600; }
+  .card.alarm .badge { background:color-mix(in srgb, var(--warn) 15%, transparent); color:var(--warn); }
+  .chart-card { height:280px; }
+  .chart-card canvas { width:100% !important; height:210px !important; }
+  .controls { grid-column: 1 / -1; display:grid; grid-template-columns: repeat(3, 1fr); gap:16px; }
+  .ctrl h2 { margin-bottom:10px; }
+  button { width:100%; padding:14px; border:0; border-radius:10px; font-size:1rem; font-weight:600;
+           cursor:pointer; background:var(--border); color:var(--text); transition:.15s; }
+  button.on { background:var(--ok); color:#fff; }
+  button.mode { background:var(--accent); color:#fff; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .hint { color:var(--muted); font-size:.82rem; margin-top:8px; }
+  #banner { display:none; grid-column:1/-1; background:var(--warn); color:#fff; padding:14px 18px;
+            border-radius:12px; font-weight:600; }
+  @media (max-width:720px) {
+    main { grid-template-columns: 1fr; }
+    .controls { grid-template-columns: 1fr; }
+    .value { font-size:2.5rem; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔥 Mạch báo cháy gia đình</h1>
+  <div class="status">
+    <span><span class="dot" id="dot"></span><span id="conn">Đang kết nối MQTT...</span></span>
+    <span>Chủ đề: <code id="topicBase"></code></span>
+  </div>
+</header>
+
+<main>
+  <div id="banner">⚠️ CẢNH BÁO: phát hiện nguy cơ cháy! Kiểm tra ngay.</div>
+
+  <!-- 2 THẺ HIỂN THỊ DỮ LIỆU DẠNG SỐ -->
+  <div class="card" id="cardGas">
+    <h2>Nồng độ khí gas / khói</h2>
+    <div class="value"><span id="gasValue">--</span><small>ppm</small></div>
+    <span class="badge" id="gasBadge">Chờ dữ liệu</span>
+  </div>
+  <div class="card" id="cardTemp">
+    <h2>Nhiệt độ</h2>
+    <div class="value"><span id="tempValue">--</span><small>°C</small></div>
+    <span class="badge" id="tempBadge">Chờ dữ liệu</span>
+  </div>
+
+  <!-- 2 BIỂU ĐỒ THỜI GIAN THỰC -->
+  <div class="card chart-card"><h2>Biểu đồ nồng độ gas (ppm)</h2><canvas id="gasChart"></canvas></div>
+  <div class="card chart-card"><h2>Biểu đồ nhiệt độ (°C)</h2><canvas id="tempChart"></canvas></div>
+
+  <!-- 2 NÚT ĐIỀU KHIỂN (MANUAL) + NÚT CHẾ ĐỘ -->
+  <div class="controls">
+    <div class="card ctrl">
+      <h2>Quạt thông gió</h2>
+      <button id="btnFan">Quạt: TẮT</button>
+    </div>
+    <div class="card ctrl">
+      <h2>Máy bơm nước</h2>
+      <button id="btnPump">Máy bơm: TẮT</button>
+    </div>
+    <div class="card ctrl">
+      <h2>Chế độ hoạt động</h2>
+      <button id="btnMode" class="mode">Chế độ: TỰ ĐỘNG</button>
+      <div class="hint">Bấm nút Quạt/Máy bơm sẽ tự chuyển sang chế độ Manual.</div>
+    </div>
+  </div>
+</main>
+
+<script>
+/* ============ CẤU HÌNH ============ */
+// PHẢI TRÙNG với BASE trong code ESP32
+const BASE = "baochay/thuydung2026/";
+const BROKER_URL = "wss://broker.emqx.io:8084/mqtt";
+const GAS_THRESHOLD = 1000;   // ppm  (trùng code ESP32)
+const TEMP_THRESHOLD = 50;    // °C   (trùng code ESP32)
+const MAX_POINTS = 30;
+
+const T = {
+  gas: BASE + "gas", temp: BASE + "temp",
+  fanState: BASE + "fan/state", pumpState: BASE + "pump/state", modeState: BASE + "mode/state",
+  fanCmd: BASE + "fan/cmd", pumpCmd: BASE + "pump/cmd", modeCmd: BASE + "mode/cmd"
+};
+document.getElementById("topicBase").textContent = BASE + "#";
+
+/* ============ BIỂU ĐỒ ============ */
+function makeChart(id, color) {
+  return new Chart(document.getElementById(id), {
+    type: "line",
+    data: { labels: [], datasets: [{ data: [], borderColor: color, backgroundColor: color + "22",
+                                     fill: true, tension: .3, pointRadius: 2 }] },
+    options: { animation: false, responsive: true, maintainAspectRatio: false,
+               plugins: { legend: { display: false } },
+               scales: { x: { ticks: { maxTicksLimit: 6 } }, y: { beginAtZero: false } } }
+  });
+}
+const gasChart = makeChart("gasChart", "#f59e0b");
+const tempChart = makeChart("tempChart", "#ef4444");
+
+function pushPoint(chart, value) {
+  const now = new Date().toLocaleTimeString("vi-VN");
+  chart.data.labels.push(now);
+  chart.data.datasets[0].data.push(value);
+  if (chart.data.labels.length > MAX_POINTS) {
+    chart.data.labels.shift(); chart.data.datasets[0].data.shift();
+  }
+  chart.update();
+}
+
+/* ============ TRẠNG THÁI ============ */
+let state = { fan: "OFF", pump: "OFF", mode: "AUTO" };
+const $ = id => document.getElementById(id);
+
+function updateButtons() {
+  const manual = state.mode === "MANUAL";
+  $("btnMode").textContent = "Chế độ: " + (manual ? "MANUAL (THỦ CÔNG)" : "TỰ ĐỘNG");
+  for (const [id, key, name] of [["btnFan","fan","Quạt"],["btnPump","pump","Máy bơm"]]) {
+    const b = $(id);
+    b.textContent = name + ": " + (state[key] === "ON" ? "BẬT" : "TẮT");
+    b.classList.toggle("on", state[key] === "ON");
+  }
+}
+
+function checkAlarm(cardId, badgeId, over, okText, badText) {
+  $(cardId).classList.toggle("alarm", over);
+  $(badgeId).textContent = over ? badText : okText;
+}
+let gasOver = false, tempOver = false;
+function refreshBanner() { $("banner").style.display = (gasOver || tempOver) ? "block" : "none"; }
+
+/* ============ MQTT ============ */
+const client = mqtt.connect(BROKER_URL, { clientId: "web-baochay-" + Math.random().toString(16).slice(2, 8) });
+
+client.on("connect", () => {
+  $("dot").classList.add("on");
+  $("conn").textContent = "Đã kết nối MQTT broker";
+  client.subscribe([T.gas, T.temp, T.fanState, T.pumpState, T.modeState]);
+});
+client.on("reconnect", () => { $("dot").classList.remove("on"); $("conn").textContent = "Đang kết nối lại..."; });
+client.on("close", () => { $("dot").classList.remove("on"); $("conn").textContent = "Mất kết nối"; });
+
+client.on("message", (topic, payload) => {
+  const msg = payload.toString().trim();
+  if (topic === T.gas) {
+    const v = parseFloat(msg);
+    $("gasValue").textContent = Math.round(v);
+    gasOver = v > GAS_THRESHOLD;
+    checkAlarm("cardGas", "gasBadge", gasOver, "Bình thường", "Vượt ngưỡng!");
+    pushPoint(gasChart, v); refreshBanner();
+  } else if (topic === T.temp) {
+    const v = parseFloat(msg);
+    $("tempValue").textContent = v.toFixed(1);
+    tempOver = v > TEMP_THRESHOLD;
+    checkAlarm("cardTemp", "tempBadge", tempOver, "Bình thường", "Vượt ngưỡng!");
+    pushPoint(tempChart, v); refreshBanner();
+  } else if (topic === T.fanState)  { state.fan = msg;  updateButtons(); }
+  else if (topic === T.pumpState)   { state.pump = msg; updateButtons(); }
+  else if (topic === T.modeState)   { state.mode = msg; updateButtons(); }
+});
+
+/* ============ NÚT BẤM ============ */
+function sendDevice(topic, key) {
+  if (state.mode !== "MANUAL") {
+    client.publish(T.modeCmd, "MANUAL");
+    state.mode = "MANUAL";
+  }
+  const next = state[key] === "ON" ? "OFF" : "ON";
+  client.publish(topic, next);
+  state[key] = next;
+  updateButtons();
+}
+$("btnFan").onclick  = () => sendDevice(T.fanCmd, "fan");
+$("btnPump").onclick = () => sendDevice(T.pumpCmd, "pump");
+$("btnMode").onclick = () => client.publish(T.modeCmd, state.mode === "AUTO" ? "MANUAL" : "AUTO");
+
+updateButtons();
+</script>
+</body>
+</html>
